@@ -8,6 +8,7 @@ on:
       - 'master'
     paths:
       - src/khoj/**
+      - src/interface/web/**
       - pyproject.toml
       - .github/workflows/pypi.yml
   pull_request:
@@ -15,25 +16,40 @@ on:
       - 'master'
     paths:
       - src/khoj/**
+      - src/interface/web/**
       - pyproject.toml
       - .github/workflows/pypi.yml
+  workflow_dispatch:
 
 jobs:
   publish:
     name: Publish Python Package to PyPI
     runs-on: ubuntu-latest
+    permissions:
+      id-token: write
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Set up Python 3.10
+      - name: Set up Python 3.11
         uses: actions/setup-python@v4
         with:
-          python-version: '3.10'
+          python-version: '3.11'
 
-      - name: ⬇️ Install Application
+      - name: ⬇️ Install Server
         run: python -m pip install --upgrade pip && pip install --upgrade .
+
+      - name: ⬇️ Install Web Client
+        run: |
+          yarn install
+          yarn pypiciexport
+        working-directory: src/interface/web
+
+      - name: 📂 Copy Generated Files
+        run: |
+          mkdir -p src/khoj/interface/compiled
+          cp -r /opt/hostedtoolcache/Python/3.11.11/x64/lib/python3.11/site-packages/khoj/interface/compiled/* src/khoj/interface/compiled/
 
       - name: ⚙️ Build Python Package
         run: |
@@ -42,23 +58,24 @@ jobs:
           export SOURCE_DATE_EPOCH=$(git log -1 --pretty=%ct)
           rm -rf dist
 
-          # Build PyPi Package
+          # Build PyPI Package
           pipx run build
 
       - name: 🌡️ Validate Python Package
         run: |
           # Validate PyPi Package
-          pipx run check-wheel-contents dist/*.whl
+          pipx run check-wheel-contents dist/*.whl --ignore W004
           pipx run twine check dist/*
 
       - name: ⏫ Upload Python Package Artifacts
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
-          name: khoj-assistant
-          path: dist/*.whl
+          name: khoj
+          path: dist/khoj-*.whl
 
       - name: 📦 Publish Python Package to PyPI
         if: startsWith(github.ref, 'refs/tags') || github.ref == 'refs/heads/master'
-        uses: pypa/gh-action-pypi-publish@v1.6.4
+        uses: pypa/gh-action-pypi-publish@release/v1.12
         with:
-          password: ${{ secrets.PYPI_API_KEY }}
+          skip-existing: true
+          print-hash: true

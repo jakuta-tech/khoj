@@ -1,11 +1,12 @@
-;;; khoj.el --- AI personal assistant for your digital brain -*- lexical-binding: t -*-
+;;; khoj.el --- Your Second Brain -*- lexical-binding: t -*-
 
-;; Copyright (C) 2021-2022 Debanjum Singh Solanky
+;; Copyright (C) 2021-2023 Khoj Inc.
 
-;; Author: Debanjum Singh Solanky <debanjum@gmail.com>
-;; Description: An AI personal assistant for your digital brain
-;; Keywords: search, chat, org-mode, outlines, markdown, pdf, image
-;; Version: 0.10.0
+;; Author: Debanjum Singh Solanky <debanjum@khoj.dev>
+;;         Saba Imran <saba@khoj.dev>
+;; Description: Your Second Brain
+;; Keywords: search, chat, ai, org-mode, outlines, markdown, pdf, image
+;; Version: 1.33.2
 ;; Package-Requires: ((emacs "27.1") (transient "0.3.0") (dash "2.19.1"))
 ;; URL: https://github.com/khoj-ai/khoj/tree/master/src/interface/emacs
 
@@ -28,19 +29,20 @@
 
 ;;; Commentary:
 
-;; Create an AI personal assistant for your `org-mode', `markdown' notes,
-;; PDFs and images. The assistant exposes 2 modes, search and chat:
+;; Bootstrap your Second Brain from your `org-mode', `markdown' notes,
+;; PDFs and images. Khoj exposes 2 modes, search and chat:
 ;;
 ;; Chat provides faster answers, iterative discovery and assisted
-;; creativity. It requires your OpenAI API key to access GPT models
+;; creativity.
 ;;
-;; Search allows natural language, incremental and local search.
-;; It relies on AI models that run locally on your machine.
+;; Search allows natural language, incremental search.
 ;;
 ;; Quickstart
 ;; -------------
 ;; 1. Install khoj.el from MELPA Stable
 ;;    (use-package khoj :pin melpa-stable :bind ("C-c s" . 'khoj))
+;; 2. Set API key from https://app.khoj.dev/settings#clients (if not self-hosting)
+;;    (setq khoj-api-key "YOUR_KHOJ_API_KEY")
 ;; 2. Start khoj from Emacs
 ;;    C-c s or M-x khoj
 ;;
@@ -62,7 +64,7 @@
 ;; Khoj Static Configuration
 ;; -------------------------
 
-(defcustom khoj-server-url "http://localhost:42110"
+(defcustom khoj-server-url "https://app.khoj.dev"
   "Location of Khoj API server."
   :group 'khoj
   :type 'string)
@@ -82,18 +84,53 @@
   :group 'khoj
   :type 'integer)
 
-(defcustom khoj-results-count 5
+(defcustom khoj-results-count 8
   "Number of results to show in search and use for chat responses."
   :group 'khoj
   :type 'integer)
 
-(defcustom khoj-default-content-type "org"
+(defcustom khoj-search-on-idle-time 0.3
+  "Idle time (in seconds) to wait before triggering search."
+  :group 'khoj
+  :type 'number)
+
+(defcustom khoj-auto-find-similar t
+  "Should try find similar notes automatically."
+  :group 'khoj
+  :type 'boolean)
+
+(defcustom khoj-api-key nil
+  "API Key to your Khoj. Default at https://app.khoj.dev/settings#clients."
+  :group 'khoj
+  :type 'string)
+
+(defcustom khoj-auto-index t
+  "Should content be automatically re-indexed every `khoj-index-interval' seconds."
+  :group 'khoj
+  :type 'boolean)
+
+(defcustom khoj-index-interval 3600
+  "Interval (in seconds) to wait before updating content index."
+  :group 'khoj
+  :type 'number)
+
+(defcustom khoj-index-files-batch 30
+  "Number of files to send for indexing in each request."
+  :group 'khoj
+  :type 'number)
+
+(defcustom khoj-default-content-type "all"
   "The default content type to perform search on."
   :group 'khoj
   :type '(choice (const "org")
                  (const "markdown")
                  (const "image")
                  (const "pdf")))
+
+(defcustom khoj-default-agent "khoj"
+  "The default agent to chat with. See https://app.khoj.dev/agents for available options."
+  :group 'khoj
+  :type 'string)
 
 
 ;; --------------------------
@@ -112,8 +149,20 @@
 (defconst khoj--chat-buffer-name "*🏮 Khoj Chat*"
   "Name of chat buffer for Khoj.")
 
+(defvar khoj--selected-agent khoj-default-agent
+  "Currently selected Khoj agent.")
+
 (defvar khoj--content-type "org"
   "The type of content to perform search on.")
+
+(defvar khoj--search-on-idle-timer nil
+  "Idle timer to trigger incremental search.")
+
+(defvar khoj--index-timer nil
+  "Timer to trigger content indexing.")
+
+(defvar khoj--indexed-files '()
+  "Files that were indexed in previous content indexing run.")
 
 (declare-function org-element-property "org-mode" (PROPERTY ELEMENT))
 (declare-function org-element-type "org-mode" (ELEMENT))
@@ -123,40 +172,19 @@ NO-PAGING FILTER))
 
 (defun khoj--keybindings-info-message ()
   "Show available khoj keybindings in-context, when khoj invoked."
-  (let ((enabled-content-types (khoj--get-enabled-content-types)))
-    (concat
-     "
+  (concat
+   "
      Set Content Type
 -------------------------\n"
-     (when (member 'markdown enabled-content-types)
-       "C-x m  | markdown\n")
-     (when (member 'org enabled-content-types)
-       "C-x o  | org-mode\n")
-     (when (member 'image enabled-content-types)
-       "C-x i  | image\n")
-     (when (member 'pdf enabled-content-types)
-       "C-x p  | pdf\n"))))
+   "C-c RET | improve sort \n"))
 
 (defvar khoj--rerank nil "Track when re-rank of results triggered.")
 (defvar khoj--reference-count 0 "Track number of references currently in chat bufffer.")
-(defun khoj--search-markdown () "Set content-type to `markdown'." (interactive) (setq khoj--content-type "markdown"))
-(defun khoj--search-org () "Set content-type to `org-mode'." (interactive) (setq khoj--content-type "org"))
-(defun khoj--search-images () "Set content-type to image." (interactive) (setq khoj--content-type "image"))
-(defun khoj--search-pdf () "Set content-type to pdf." (interactive) (setq khoj--content-type "pdf"))
-(defun khoj--improve-rank () "Use cross-encoder to rerank search results." (interactive) (khoj--incremental-search t))
+(defun khoj--improve-sort () "Use cross-encoder to improve sorting of search results." (interactive) (khoj--incremental-search t))
 (defun khoj--make-search-keymap (&optional existing-keymap)
   "Setup keymap to configure Khoj search. Build of EXISTING-KEYMAP when passed."
-  (let ((enabled-content-types (khoj--get-enabled-content-types))
-        (kmap (or existing-keymap (make-sparse-keymap))))
-    (define-key kmap (kbd "C-c RET") #'khoj--improve-rank)
-    (when (member 'markdown enabled-content-types)
-      (define-key kmap (kbd "C-x m") #'khoj--search-markdown))
-    (when (member 'org enabled-content-types)
-      (define-key kmap (kbd "C-x o") #'khoj--search-org))
-    (when (member 'image enabled-content-types)
-      (define-key kmap (kbd "C-x i") #'khoj--search-images))
-    (when (member 'pdf enabled-content-types)
-      (define-key kmap (kbd "C-x p") #'khoj--search-pdf))
+  (let ((kmap (or existing-keymap (make-sparse-keymap))))
+    (define-key kmap (kbd "C-c RET") #'khoj--improve-sort)
     kmap))
 
 (defvar khoj--keymap nil "Track Khoj keymap in this variable.")
@@ -169,6 +197,9 @@ Use `which-key` if available, else display simple message in echo area"
                                 (symbol-value 'khoj--keymap)
                                 nil t t))
     (message "%s" (khoj--keybindings-info-message))))
+
+(defvar khoj--last-heading-pos nil
+  "The last heading position point was in.")
 
 
 ;; ----------------
@@ -211,7 +242,7 @@ for example), set this to the full interpreter path."
           (member val '("python" "python3" "pythonw" "py")))
   :group 'khoj)
 
-(defcustom khoj-org-files (org-agenda-files t t)
+(defcustom khoj-org-files nil
   "List of org-files to index on khoj server."
   :type '(repeat string)
   :group 'khoj)
@@ -221,19 +252,17 @@ for example), set this to the full interpreter path."
   :type '(repeat string)
   :group 'khoj)
 
-(defcustom khoj-chat-model "gpt-3.5-turbo"
-  "Specify chat model to use for chat with khoj."
-  :type 'string
+(make-obsolete-variable 'khoj-org-directories 'khoj-index-directories "1.2.0" 'set)
+(make-obsolete-variable 'khoj-org-files 'khoj-index-files "1.2.0" 'set)
+
+(defcustom khoj-index-files (org-agenda-files t t)
+  "List of org, md, text, pdf to index on khoj server."
+  :type '(repeat string)
   :group 'khoj)
 
-(defcustom khoj-openai-api-key nil
-  "OpenAI API key used to configure chat on khoj server."
-  :type 'string
-  :group 'khoj)
-
-(defcustom khoj-chat-offline nil
-  "Use offline model to chat with khoj."
-  :type 'boolean
+(defcustom khoj-index-directories nil
+  "List of directories with org, md, text, pdf to index on khoj server."
+  :type '(repeat string)
   :group 'khoj)
 
 (defcustom khoj-auto-setup t
@@ -263,9 +292,9 @@ Auto invokes setup steps on calling main entrypoint."
     (if (/= (apply #'call-process khoj-server-python-command
                    nil t nil
                    "-m" "pip" "install" "--upgrade"
-                   '("khoj-assistant"))
+                   '("khoj"))
             0)
-        (message "khoj.el: Failed to install Khoj server. Please install it manually using pip install `khoj-assistant'.\n%s" (buffer-string))
+        (message "khoj.el: Failed to install Khoj server. Please install it manually using pip install `khoj'.\n%s" (buffer-string))
       (message "khoj.el: Installed and upgraded Khoj server version: %s" (khoj--server-get-version)))))
 
 (defun khoj--server-start ()
@@ -289,8 +318,7 @@ Auto invokes setup steps on calling main entrypoint."
            :filter (lambda (process msg)
                      (cond ((string-match (format "Uvicorn running on %s" khoj-server-url) msg)
                             (progn
-                              (setq khoj--server-ready? t)
-                              (khoj--server-configure)))
+                              (setq khoj--server-ready? t)))
                            ((string-match "Batches:  " msg)
                             (when (string-match "\\([0-9]+\\.[0-9]+\\|\\([0-9]+\\)\\)%?" msg)
                               (message "khoj.el: %s updating index %s"
@@ -321,7 +349,7 @@ Auto invokes setup steps on calling main entrypoint."
       t
     ;; else general check via ping to khoj-server-url
     (if (ignore-errors
-          (url-retrieve-synchronously (format "%s/api/config/data/default" khoj-server-url)))
+          (url-retrieve-synchronously (format "%s/api/health" khoj-server-url)))
         ;; Successful ping to non-emacs khoj server indicates it is started and ready.
         ;; So update ready state tracker variable (and implicitly return true for started)
         (setq khoj--server-ready? t)
@@ -353,146 +381,13 @@ Auto invokes setup steps on calling main entrypoint."
   (when (not (khoj--server-started?))
     (khoj--server-start)))
 
-(defun khoj--get-directory-from-config (config keys &optional level)
-  "Extract directory under specified KEYS in CONFIG and trim it to LEVEL.
-CONFIG is json obtained from Khoj config API."
-  (let ((item config))
-    (dolist (key keys)
-      (setq item (cdr (assoc key item))))
-      (-> item
-          (split-string "/")
-          (butlast (or level nil))
-          (string-join "/"))))
-
-(defun khoj--server-configure ()
-  "Configure the the Khoj server for search and chat."
-  (interactive)
-  (let* ((org-directory-regexes (or (mapcar (lambda (dir) (format "%s/**/*.org" dir)) khoj-org-directories) json-null))
-         (current-config
-          (with-temp-buffer
-            (url-insert-file-contents (format "%s/api/config/data" khoj-server-url))
-            (ignore-error json-end-of-file (json-parse-buffer :object-type 'alist :array-type 'list :null-object json-null :false-object json-false))))
-         (default-config
-           (with-temp-buffer
-             (url-insert-file-contents (format "%s/api/config/data/default" khoj-server-url))
-             (ignore-error json-end-of-file (json-parse-buffer :object-type 'alist :array-type 'list :null-object json-null :false-object json-false))))
-         (default-index-dir (khoj--get-directory-from-config default-config '(content-type org embeddings-file)))
-         (default-chat-dir (khoj--get-directory-from-config default-config '(processor conversation conversation-logfile)))
-         (chat-model (or khoj-chat-model (alist-get 'chat-model (alist-get 'openai (alist-get 'conversation (alist-get 'processor default-config))))))
-         (default-model (alist-get 'model (alist-get 'conversation (alist-get 'processor default-config))))
-         (enable-offline-chat (or khoj-chat-offline (alist-get 'enable-offline-chat (alist-get 'conversation (alist-get 'processor default-config)))))
-         (config (or current-config default-config)))
-
-    ;; Configure content types
-    (cond
-     ;; If khoj backend is not configured yet
-     ((not current-config)
-      (message "khoj.el: Server not configured yet.")
-      (setq config (delq (assoc 'content-type config) config))
-      (cl-pushnew `(content-type . ((org . ((input-files . ,khoj-org-files)
-                                            (input-filter . ,org-directory-regexes)
-                                            (compressed-jsonl . ,(format "%s/org.jsonl.gz" default-index-dir))
-                                            (embeddings-file . ,(format "%s/org.pt" default-index-dir))
-                                            (index-heading-entries . ,json-false)))))
-                  config))
-
-     ;; Else if khoj config has no org content config
-     ((not (alist-get 'org (alist-get 'content-type config)))
-      (message "khoj.el: Org-mode content on server not configured yet.")
-     (let ((new-content-type (alist-get 'content-type config)))
-        (setq new-content-type (delq (assoc 'org new-content-type) new-content-type))
-        (cl-pushnew `(org . ((input-files . ,khoj-org-files)
-                             (input-filter . ,org-directory-regexes)
-                             (compressed-jsonl . ,(format "%s/org.jsonl.gz" default-index-dir))
-                             (embeddings-file . ,(format "%s/org.pt" default-index-dir))
-                             (index-heading-entries . ,json-false)))
-                    new-content-type)
-        (setq config (delq (assoc 'content-type config) config))
-        (cl-pushnew `(content-type . ,new-content-type) config)))
-
-     ;; Else if khoj is not configured to index specified org files
-     ((not (and (equal (alist-get 'input-files (alist-get 'org (alist-get 'content-type config))) khoj-org-files)
-                (equal (alist-get 'input-filter (alist-get 'org (alist-get 'content-type config))) org-directory-regexes)))
-      (message "khoj.el: Org-mode content on server is stale.")
-      (let* ((index-directory (khoj--get-directory-from-config config '(content-type org embeddings-file)))
-             (new-content-type (alist-get 'content-type config)))
-        (setq new-content-type (delq (assoc 'org new-content-type) new-content-type))
-        (cl-pushnew `(org . ((input-files . ,khoj-org-files)
-                             (input-filter . ,org-directory-regexes)
-                             (compressed-jsonl . ,(format "%s/org.jsonl.gz" index-directory))
-                             (embeddings-file . ,(format "%s/org.pt" index-directory))
-                             (index-heading-entries . ,json-false)))
-                    new-content-type)
-        (setq config (delq (assoc 'content-type config) config))
-        (cl-pushnew `(content-type . ,new-content-type) config))))
-
-    ;; Configure processors
-    (cond
-     ((not khoj-openai-api-key)
-      (let* ((processor (assoc 'processor config))
-             (conversation (assoc 'conversation processor))
-             (openai (assoc 'openai conversation)))
-        (when openai
-          ;; Unset the `openai' field in the khoj conversation processor config
-          (message "khoj.el: Disable Chat using OpenAI as your OpenAI API key got removed from config")
-          (setcdr conversation (delq openai (cdr conversation)))
-          (push conversation (cdr processor))
-          (push processor config))))
-
-     ;; If khoj backend isn't configured yet
-     ((not current-config)
-      (message "khoj.el: Chat not configured yet.")
-      (setq config (delq (assoc 'processor config) config))
-      (cl-pushnew `(processor . ((conversation . ((conversation-logfile . ,(format "%s/conversation.json" default-chat-dir))
-                                                  (enable-offline-chat . ,enable-offline-chat)
-                                                  (openai . ((chat-model . ,chat-model)
-                                                             (api-key . ,khoj-openai-api-key)))))))
-                  config))
-
-     ;; Else if chat isn't configured in khoj backend
-     ((not (alist-get 'conversation (alist-get 'processor config)))
-      (message "khoj.el: Chat not configured yet.")
-       (let ((new-processor-type (alist-get 'processor config)))
-         (setq new-processor-type (delq (assoc 'conversation new-processor-type) new-processor-type))
-         (cl-pushnew `(conversation . ((conversation-logfile . ,(format "%s/conversation.json" default-chat-dir))
-                                       (enable-offline-chat . ,enable-offline-chat)
-                                       (openai . ((chat-model . ,chat-model)
-                                                  (api-key . ,khoj-openai-api-key)))))
-                     new-processor-type)
-        (setq config (delq (assoc 'processor config) config))
-        (cl-pushnew `(processor . ,new-processor-type) config)))
-
-     ;; Else if chat configuration in khoj backend has gone stale
-     ((not (and (equal (alist-get 'api-key (alist-get 'openai (alist-get 'conversation (alist-get 'processor config)))) khoj-openai-api-key)
-                (equal (alist-get 'chat-model (alist-get 'openai (alist-get 'conversation (alist-get 'processor config)))) khoj-chat-model)
-                (equal (alist-get 'enable-offline-chat (alist-get 'conversation (alist-get 'processor config))) enable-offline-chat)))
-      (message "khoj.el: Chat configuration has gone stale.")
-      (let* ((chat-directory (khoj--get-directory-from-config config '(processor conversation conversation-logfile)))
-             (new-processor-type (alist-get 'processor config)))
-        (setq new-processor-type (delq (assoc 'conversation new-processor-type) new-processor-type))
-        (cl-pushnew `(conversation . ((conversation-logfile . ,(format "%s/conversation.json" chat-directory))
-                                      (enable-offline-chat . ,enable-offline-chat)
-                                      (openai . ((chat-model . ,khoj-chat-model)
-                                                 (api-key . ,khoj-openai-api-key)))))
-                    new-processor-type)
-        (setq config (delq (assoc 'processor config) config))
-        (cl-pushnew `(processor . ,new-processor-type) config))))
-
-      ;; Update server with latest configuration, if required
-      (cond ((not current-config)
-            (khoj--post-new-config config)
-            (message "khoj.el: ⚙️ Generated new khoj server configuration."))
-           ((not (equal config current-config))
-            (khoj--post-new-config config)
-            (message "khoj.el: ⚙️ Updated khoj server configuration.")))))
-
 (defun khoj-setup (&optional interact)
-  "Install, start and configure Khoj server. Get permission if INTERACT is non-nil."
+  "Install and start Khoj server. Get permission if INTERACT is non-nil."
   (interactive "p")
   ;; Setup khoj server if not running
   (let* ((not-started (not (khoj--server-started?)))
          (permitted (if (and not-started interact)
-                        (y-or-n-p "Could not connect to Khoj server. Should I install, start and configure it for you?")
+                        (y-or-n-p "Could not connect to Khoj server. Should I install, start it for you?")
                       t)))
     ;; If user permits setup of khoj server from khoj.el
     (when permitted
@@ -501,22 +396,133 @@ CONFIG is json obtained from Khoj config API."
         (khoj--server-setup))
 
       ;; Wait until server is ready
-      ;; As server can be started but not ready to use/configure
+      ;; As server can be started but not ready to use
       (while (not khoj--server-ready?)
-        (sit-for 0.5))
-
-      ;; Configure server once it's ready
-      (khoj--server-configure))))
+        (sit-for 0.5)))))
 
 
-;; -----------------------------------------------
-;; Extract and Render Entries of each Content Type
-;; -----------------------------------------------
+;; -------------------
+;; Khoj Index Content
+;; -------------------
 
-(defun khoj--extract-entries-as-markdown (json-response query)
-  "Convert JSON-RESPONSE, QUERY from API to markdown entries."
+(defun khoj--server-index-files (&optional force content-type file-paths)
+  "Send files at `FILE-PATHS' to the Khoj server to index for search and chat.
+`FORCE' re-indexes all files of `CONTENT-TYPE' even if they are already indexed."
+  (interactive)
+  (let* ((boundary (format "-------------------------%d" (random (expt 10 10))))
+         ;; Use `khoj-index-directories', `khoj-index-files' when set, else fallback to `khoj-org-directories', `khoj-org-files'
+         ;; This is a temporary change. `khoj-org-directories', `khoj-org-files' are deprecated. They will be removed in a future release
+         (content-directories (or khoj-index-directories khoj-org-directories))
+         (content-files (or khoj-index-files khoj-org-files))
+         (files-to-index (mapcar
+                          #'expand-file-name
+                          (or file-paths
+                              (append (mapcan (lambda (dir) (directory-files-recursively dir "\\.\\(org\\|md\\|markdown\\|pdf\\|txt\\|rst\\|xml\\|htm\\|html\\)$")) content-directories) content-files))))
+         (type-query (if (or (equal content-type "all") (not content-type)) "" (format "t=%s" content-type)))
+         (delete-files (-difference khoj--indexed-files files-to-index))
+         (inhibit-message t)
+         (message-log-max nil)
+         (batch-size khoj-index-files-batch))
+    (dolist (files (-partition-all batch-size files-to-index))
+      (khoj--send-index-update-request (khoj--render-update-files-as-request-body files boundary) boundary content-type type-query force))
+    (when delete-files
+        (khoj--send-index-update-request (khoj--render-delete-files-as-request-body delete-files boundary) boundary content-type type-query force))
+    (setq khoj--indexed-files files-to-index)))
+
+(defun khoj--send-index-update-request (body boundary &optional content-type type-query force)
+  "Send multi-part form `BODY' of `CONTENT-TYPE' in request to khoj server.
+Append 'TYPE-QUERY' as query parameter in request url.
+Specify `BOUNDARY' used to separate files in request header."
+  (let ((url-request-method (if force "PUT" "PATCH"))
+        (url-request-data (encode-coding-string body 'utf-8))
+        (url-request-extra-headers `(("content-type" . ,(format "multipart/form-data; boundary=%s" boundary))
+                                     ("Authorization" . ,(encode-coding-string (format "Bearer %s" khoj-api-key) 'utf-8)))))
+      (with-current-buffer
+          (url-retrieve (format "%s/api/content?%s&client=emacs" khoj-server-url type-query)
+                        ;; render response from indexing API endpoint on server
+                        (lambda (status)
+                          (if (not (plist-get status :error))
+                              (message "khoj.el: %scontent index %supdated" (if content-type (format "%s " content-type) "all ") (if force "force " ""))
+                            (progn
+                              (khoj--delete-open-network-connections-to-server)
+                              (with-current-buffer (current-buffer)
+                                (search-forward "\n\n" nil t)
+                                (message "khoj.el: Failed to %supdate %scontent index. Status: %s%s"
+                                         (if force "force " "")
+                                         (if content-type (format "%s " content-type) "all")
+                                         (string-trim (format "%s %s" (nth 1 (nth 1 status)) (nth 2 (nth 1 status))))
+                                         (if (> (- (point-max) (point)) 0) (format ". Response: %s" (string-trim (buffer-substring-no-properties (point) (point-max)))) ""))))))
+                        nil t t))))
+
+(defun khoj--render-update-files-as-request-body (files-to-index boundary)
+  "Render `FILES-TO-INDEX', `PREVIOUSLY-INDEXED-FILES' as multi-part form body.
+Use `BOUNDARY' to separate files. This is sent to Khoj server as a POST request."
+  (with-temp-buffer
+    (set-buffer-multibyte nil)
+    (insert "\n")
+    (dolist (file-to-index files-to-index)
+      ;; find file content-type. Choose from org, markdown, pdf, plaintext
+      (let ((content-type (khoj--filename-to-mime-type file-to-index))
+            (file-name (encode-coding-string  file-to-index 'utf-8)))
+      (insert (format "--%s\r\n" boundary))
+      (insert (format "Content-Disposition: form-data; name=\"files\"; filename=\"%s\"\r\n" file-name))
+      (insert (format "Content-Type: %s\r\n\r\n" content-type))
+      (insert (with-temp-buffer
+                (insert-file-contents-literally file-to-index)
+                (buffer-string)))
+      (insert "\r\n")))
+    (insert (format "--%s--\r\n" boundary))
+    (buffer-string)))
+
+(defun khoj--render-delete-files-as-request-body (delete-files boundary)
+  "Render `DELETE-FILES' as multi-part form body.
+Use `BOUNDARY' to separate files. This is sent to Khoj server as a POST request."
+  (with-temp-buffer
+    (set-buffer-multibyte nil)
+    (insert "\n")
+    (dolist (file-to-index delete-files)
+      (let ((content-type (khoj--filename-to-mime-type file-to-index))
+            (file-name (encode-coding-string  file-to-index 'utf-8)))
+          (insert (format "--%s\r\n" boundary))
+          (insert (format "Content-Disposition: form-data; name=\"files\"; filename=\"%s\"\r\n" file-name))
+          (insert (format "Content-Type: %s\r\n\r\n" content-type))
+          (insert "")
+          (insert "\r\n")))
+    (insert (format "--%s--\r\n" boundary))
+    (buffer-string)))
+
+(defun khoj--filename-to-mime-type (file-name)
+  "`FILE-NAME' to mimeType."
+  (cond ((string-match "\\.org$" file-name) "text/org")
+        ((string-match "\\.\\(md\\|markdown\\)$" file-name) "text/markdown")
+        ((string-match "\\.pdf$" file-name) "application/pdf")
+        (t "text/plain")))
+
+;; Cancel any running indexing timer, first
+(when khoj--index-timer
+    (cancel-timer khoj--index-timer))
+;; Send files to index on server every `khoj-index-interval' seconds
+(when khoj-auto-index
+  (setq khoj--index-timer
+        (run-with-timer 60 khoj-index-interval 'khoj--server-index-files)))
+
+
+;; -------------------------------------------
+;; Render Response from Khoj server for Emacs
+;; -------------------------------------------
+(defun khoj--construct-find-similar-title (query)
+  "Construct title for find-similar QUERY."
+  (format "Similar to: %s"
+          (replace-regexp-in-string "^[#\\*]* " "" (car (split-string query "\n")))))
+
+(defun khoj--extract-entries-as-markdown (json-response query is-find-similar)
+  "Convert JSON-RESPONSE, QUERY from API to markdown entries.
+Use IS-FIND-SIMILAR bool to filter out first result.
+As first result is the current entry at point."
   (thread-last
     json-response
+    ;; filter our first result if is find similar as it'll be the current entry at point
+    ((lambda (response) (if is-find-similar (seq-drop response 1) response)))
     ;; Extract and render each markdown entry from response
     (mapcar (lambda (json-response-item)
               (thread-last
@@ -527,14 +533,18 @@ CONFIG is json obtained from Khoj config API."
                 ;; Standardize results to 2nd level heading for consistent rendering
                 (replace-regexp-in-string "^\#+" "##"))))
     ;; Render entries into markdown formatted string with query set as as top level heading
-    (format "# %s\n%s" query)
+    (format "# %s\n%s" (if is-find-similar (khoj--construct-find-similar-title query) query))
     ;; remove leading (, ) or SPC from extracted entries string
     (replace-regexp-in-string "^[\(\) ]" "")))
 
-(defun khoj--extract-entries-as-org (json-response query)
-  "Convert JSON-RESPONSE, QUERY from API to `org-mode' entries."
+(defun khoj--extract-entries-as-org (json-response query is-find-similar)
+  "Convert JSON-RESPONSE, QUERY from API to `org-mode' entries.
+Use IS-FIND-SIMILAR bool to filter out first result.
+As first result is the current entry at point."
   (thread-last
     json-response
+    ;; filter our first result if is find similar as it'll be the current entry at point
+    ((lambda (response) (if is-find-similar (seq-drop response 1) response)))
     ;; Extract and render each org-mode entry from response
     (mapcar (lambda (json-response-item)
               (thread-last
@@ -545,14 +555,18 @@ CONFIG is json obtained from Khoj config API."
                 ;; Standardize results to 2nd level heading for consistent rendering
                 (replace-regexp-in-string "^\*+" "**"))))
     ;; Render entries into org formatted string with query set as as top level heading
-    (format "* %s\n%s\n" query)
+    (format "* %s\n%s\n" (if is-find-similar (khoj--construct-find-similar-title query) query))
     ;; remove leading (, ) or SPC from extracted entries string
     (replace-regexp-in-string "^[\(\) ]" "")))
 
-(defun khoj--extract-entries-as-pdf (json-response query)
-  "Convert QUERY, JSON-RESPONSE from API with PDF results to `org-mode' entries."
+(defun khoj--extract-entries-as-pdf (json-response query is-find-similar)
+  "Convert JSON-RESPONSE, QUERY from API to PDF entries.
+Use IS-FIND-SIMILAR bool to filter out first result.
+As first result is the current entry at point."
   (thread-last
     json-response
+    ;; filter our first result if is find similar as it'll be the current entry at point
+    ((lambda (response) (if is-find-similar (seq-drop response 1) response)))
     ;; Extract and render each pdf entry from response
     (mapcar (lambda (json-response-item)
               (thread-last
@@ -561,7 +575,7 @@ CONFIG is json obtained from Khoj config API."
                 ;; Format pdf entry as a org entry string
                 (format "** %s\n\n"))))
     ;; Render entries into org formatted string with query set as as top level heading
-    (format "* %s\n%s\n" query)
+    (format "* %s\n%s\n" (if is-find-similar (khoj--construct-find-similar-title query) query))
     ;; remove leading (, ) or SPC from extracted entries string
     (replace-regexp-in-string "^[\(\) ]" "")))
 
@@ -593,9 +607,13 @@ CONFIG is json obtained from Khoj config API."
       ;; remove trailing (, ) or SPC from extracted entries string
       (replace-regexp-in-string "[\(\) ]$" ""))))
 
-(defun khoj--extract-entries (json-response query)
-  "Convert JSON-RESPONSE, QUERY from API to text entries."
+(defun khoj--extract-entries (json-response query is-find-similar)
+  "Convert JSON-RESPONSE, QUERY from API to text entries.
+Use IS-FIND-SIMILAR bool to filter out first result.
+As first result is the current entry at point."
   (thread-last json-response
+               ;; filter our first result if is find similar as it'll be the current entry at point
+               ((lambda (response) (if is-find-similar (seq-drop response 1) response)))
                ;; extract and render entries from API response
                (mapcar (lambda (json-response-item)
                          (thread-last
@@ -609,7 +627,7 @@ CONFIG is json obtained from Khoj config API."
                            ;; Format entries as org entry string
                            (format "** %s"))))
                ;; Set query as heading in rendered results buffer
-               (format "* %s\n%s\n" query)
+               (format "* %s\n%s\n" (if is-find-similar (khoj--construct-find-similar-title query) query))
                ;; remove leading (, ) or SPC from extracted entries string
                (replace-regexp-in-string "^[\(\) ]" "")
                ;; remove trailing (, ) or SPC from extracted entries string
@@ -625,76 +643,124 @@ CONFIG is json obtained from Khoj config API."
      ((and (member 'markdown enabled-content-types) (or (equal file-extension "markdown") (equal file-extension "md"))) "markdown")
      (t khoj-default-content-type))))
 
+
+(defun khoj--org-cycle-content (&optional arg)
+  "Show all headlines in the buffer, like a table of contents.
+With numerical argument ARG, show content up to level ARG.
+
+Simplified fork of `org-cycle-content' from Emacs 29.1 to work with >=27.1."
+  (interactive "p")
+  (save-excursion
+    (goto-char (point-max))
+    (let ((regexp (if (and (wholenump arg) (> arg 0))
+                      (format "^\\*\\{1,%d\\} " arg)
+                    "^\\*+ "))
+          (last (point)))
+      (while (re-search-backward regexp nil t)
+        (org-fold-region (line-end-position) last t 'outline)
+        (setq last (line-end-position 0))))))
+
 
 ;; --------------
 ;; Query Khoj API
 ;; --------------
+(defun khoj--call-api (path &optional method params body callback &rest cbargs)
+  "Sync call API at PATH with METHOD, query PARAMS and BODY as kv assoc list.
+Optionally apply CALLBACK with JSON parsed response and CBARGS."
+  (let* ((url-request-method (or method "GET"))
+         (url-request-extra-headers `(("Authorization" . ,(encode-coding-string (format "Bearer %s" khoj-api-key) 'utf-8))
+                                      ("Content-Type" . "application/json")))
+         (url-request-data (if body (encode-coding-string (json-encode body) 'utf-8) nil))
+         (param-string (url-build-query-string (append params '((client "emacs")))))
+         (query-url (format "%s%s?%s" khoj-server-url path param-string))
+         (cbargs (if (and (listp cbargs) (listp (car cbargs))) (car cbargs) cbargs))) ; normalize cbargs to (a b) from ((a b)) if required
+    (with-temp-buffer
+      (condition-case ex
+          (progn
+            (url-insert-file-contents query-url)
+            (if (and callback cbargs)
+                (apply callback (json-parse-buffer :object-type 'alist) cbargs)
+              (if callback
+                  (funcall callback (json-parse-buffer :object-type 'alist))
+            (json-parse-buffer :object-type 'alist))))
+        ('file-error (message "Chat exception: [%s]" ex))))))
 
-(defun khoj--post-new-config (config)
-  "Configure khoj server with provided CONFIG."
-  ;; POST provided config to khoj server
-  (let ((url-request-method "POST")
-        (url-request-extra-headers '(("Content-Type" . "application/json")))
-        (url-request-data (encode-coding-string (json-encode-alist config) 'utf-8))
-        (config-url (format "%s/api/config/data" khoj-server-url)))
-    (with-current-buffer (url-retrieve-synchronously config-url)
-      (buffer-string)))
-  ;; Update index on khoj server after configuration update
-  (let ((khoj--server-ready? nil))
-    (url-retrieve (format "%s/api/update?client=emacs" khoj-server-url) #'identity)))
+(defun khoj--call-api-async (path &optional method params body callback &rest cbargs)
+  "Async call to API at PATH with specified METHOD, query PARAMS and request BODY.
+Optionally apply CALLBACK with JSON parsed response and CBARGS."
+  (let* ((url-request-method (or method "GET"))
+         (url-request-extra-headers `(("Authorization" . ,(encode-coding-string (format "Bearer %s" khoj-api-key) 'utf-8))
+                                      ("Content-Type" . "application/json")))
+         (url-request-data (if body (encode-coding-string (json-encode body) 'utf-8) nil))
+         (param-string (url-build-query-string (append params '((client "emacs")))))
+         (query-url (format "%s%s?%s" khoj-server-url path param-string))
+         (cbargs (if (and (listp cbargs) (listp (car cbargs))) (car cbargs) cbargs))) ; normalize cbargs to (a b) from ((a b)) if required
+    (url-retrieve query-url
+                  (lambda (status)
+                    (if (plist-get status :error)
+                        (message "Chat exception: [%s]" (plist-get status :error))
+                      (goto-char (point-min))
+                      (re-search-forward "^$")
+                      (delete-region (point) (point-min))
+                      (if (and callback cbargs)
+                          (apply callback (json-parse-buffer :object-type 'alist) cbargs)
+                        (if callback
+                            (funcall callback (json-parse-buffer :object-type 'alist))
+                          (json-parse-buffer :object-type 'alist))))))))
 
 (defun khoj--get-enabled-content-types ()
   "Get content types enabled for search from API."
-  (let ((config-url (format "%s/api/config/types" khoj-server-url))
-        (url-request-method "GET"))
-    (with-temp-buffer
-      (url-insert-file-contents config-url)
-      (thread-last
-        (json-parse-buffer :object-type 'alist)
-        (mapcar #'intern)))))
+  (khoj--call-api "/api/content/types" "GET" nil nil `(lambda (item) (mapcar #'intern item))))
 
-(defun khoj--construct-search-api-query (query content-type &optional rerank)
-  "Construct Search API Query.
-Use QUERY, CONTENT-TYPE and (optional) RERANK as query params"
-  (let ((rerank (or rerank "false"))
-        (encoded-query (url-hexify-string query)))
-    (format "%s/api/search?q=%s&t=%s&r=%s&n=%s&client=emacs" khoj-server-url encoded-query content-type rerank khoj-results-count)))
+(defun khoj--query-search-api-and-render-results (query content-type buffer-name &optional rerank is-find-similar)
+  "Query Khoj Search API with QUERY, CONTENT-TYPE and RERANK as query params.
+Render search results in BUFFER-NAME using CONTENT-TYPE and QUERY.
+Filter out first similar result if IS-FIND-SIMILAR set."
+  (let* ((rerank (or rerank "false"))
+         (params `((q ,(encode-coding-string query 'utf-8))
+                   (t ,content-type)
+                   (r ,rerank)
+                   (n ,khoj-results-count)))
+         (path "/api/search"))
+    (khoj--call-api-async path
+                    "GET"
+                    params
+                    nil
+                    'khoj--render-search-results
+                    content-type query buffer-name is-find-similar)))
 
-(defun khoj--query-search-api-and-render-results (query-url content-type query buffer-name)
-  "Query Khoj Search with QUERY-URL.
-Render results in BUFFER-NAME using QUERY, CONTENT-TYPE."
-  ;; get json response from api
-  (with-current-buffer buffer-name
-    (let ((inhibit-read-only t)
-          (url-request-method "GET"))
-      (erase-buffer)
-      (url-insert-file-contents query-url)))
+(defun khoj--render-search-results (json-response content-type query buffer-name &optional is-find-similar)
+  "Render search results in BUFFER-NAME using JSON-RESPONSE, CONTENT-TYPE, QUERY.
+Filter out first similar result if IS-FIND-SIMILAR set."
   ;; render json response into formatted entries
   (with-current-buffer buffer-name
-    (let ((inhibit-read-only t)
-          (json-response (json-parse-buffer :object-type 'alist)))
+    (let ((is-find-similar (or is-find-similar nil))
+          (inhibit-read-only t))
       (erase-buffer)
       (insert
-       (cond ((equal content-type "org") (khoj--extract-entries-as-org json-response query))
-             ((equal content-type "markdown") (khoj--extract-entries-as-markdown json-response query))
-             ((equal content-type "pdf") (khoj--extract-entries-as-pdf json-response query))
+       (cond ((equal content-type "org") (khoj--extract-entries-as-org json-response query is-find-similar))
+             ((equal content-type "markdown") (khoj--extract-entries-as-markdown json-response query is-find-similar))
+             ((equal content-type "pdf") (khoj--extract-entries-as-pdf json-response query is-find-similar))
              ((equal content-type "image") (khoj--extract-entries-as-images json-response query))
-             (t (khoj--extract-entries json-response query))))
+             (t (khoj--extract-entries json-response query is-find-similar))))
       (cond ((or (equal content-type "all")
                  (equal content-type "pdf")
                  (equal content-type "org"))
              (progn (visual-line-mode)
                     (org-mode)
-                   (setq-local
-                    org-startup-folded "showall"
-                    org-hide-leading-stars t
-                    org-startup-with-inline-images t)
-                   (org-set-startup-visibility)))
+                    (setq-local
+                     org-hide-leading-stars t
+                     org-startup-with-inline-images t)
+                    (khoj--org-cycle-content 2)))
             ((equal content-type "markdown") (progn (markdown-mode)
                                                     (visual-line-mode)))
             ((equal content-type "image") (progn (shr-render-region (point-min) (point-max))
-                                                (goto-char (point-min))))
+                                                 (goto-char (point-min))))
             (t (fundamental-mode))))
+    ;; keep cursor at top of khoj buffer by default
+    (goto-char (point-min))
+    ;; enable minor modes for khoj chat
+    (visual-line-mode)
     (read-only-mode t)))
 
 
@@ -702,32 +768,61 @@ Render results in BUFFER-NAME using QUERY, CONTENT-TYPE."
 ;; Khoj Chat
 ;; ----------------
 
-(defun khoj--chat ()
-  "Chat with Khoj."
+(defun khoj--chat (&optional session-id)
+  "Chat with Khoj in session with SESSION-ID."
   (interactive)
-  (when (not (get-buffer khoj--chat-buffer-name))
-      (khoj--load-chat-history khoj--chat-buffer-name))
-  (switch-to-buffer khoj--chat-buffer-name)
+  (when (or session-id (not (get-buffer khoj--chat-buffer-name)))
+    (khoj--load-chat-session khoj--chat-buffer-name session-id))
   (let ((query (read-string "Query: ")))
     (when (not (string-empty-p query))
-      (khoj--query-chat-api-and-render-messages query khoj--chat-buffer-name))))
+      (khoj--query-chat-api-and-render-messages query khoj--chat-buffer-name session-id))))
 
-(defun khoj--load-chat-history (buffer-name)
-  "Load Khoj Chat conversation history into BUFFER-NAME."
-  (let ((json-response (cdr (assoc 'response (khoj--get-chat-history-api)))))
+(defun khoj--open-side-pane (buffer-name)
+  "Open Khoj BUFFER-NAME in right side pane."
+  (save-selected-window
+    (if (get-buffer-window-list buffer-name)
+        ;; if window is already open, switch to it
+        (progn
+          (select-window (get-buffer-window buffer-name))
+          (switch-to-buffer buffer-name))
+      ;; else if window is not open, open it as a right-side window pane
+      (let ((bottomright-window (some-window (lambda (window) (and (window-at-side-p window 'right) (window-at-side-p window 'bottom))))))
+        (progn
+          ;; Select the right-most window
+          (select-window bottomright-window)
+          ;; if bottom-right window is not a vertical pane, split it vertically, else use the existing bottom-right vertical window
+          (let ((khoj-window (if (window-at-side-p bottomright-window 'left)
+                                 (split-window-right)
+                               bottomright-window)))
+            ;; Set the buffer in the khoj window
+            (set-window-buffer khoj-window buffer-name)
+            ;; Switch to the khoj window
+            (select-window khoj-window)
+            ;; Resize the window to 1/3 of the frame width
+            (window-resize khoj-window
+                           (- (truncate (* 0.33 (frame-width))) (window-width))
+                           t)))))
+    (goto-char (point-max))))
+
+(defun khoj--load-chat-session (buffer-name &optional session-id)
+  "Load Khoj Chat conversation history from SESSION-ID into BUFFER-NAME."
+  (setq khoj--reference-count 0)
+  (let ((inhibit-read-only t)
+        (json-response (cdr (assoc 'chat (cdr (assoc 'response (khoj--get-chat-session session-id)))))))
     (with-current-buffer (get-buffer-create buffer-name)
-      (erase-buffer)
-      (insert "* Khoj Chat\n")
-      (thread-last
-        json-response
-        ;; generate chat messages from Khoj Chat API response
-        (mapcar #'khoj--render-chat-response)
-        ;; insert chat messages into Khoj Chat Buffer
-        (mapc #'insert))
       (progn
+        (erase-buffer)
+        (insert "* Khoj Chat\n")
+        (when json-response
+          (thread-last
+            json-response
+            ;; generate chat messages from Khoj Chat API response
+            (mapcar #'khoj--format-chat-response)
+            ;; insert chat messages into Khoj Chat Buffer
+            (mapc #'insert)))
         (org-mode)
-        (khoj--add-hover-text-to-footnote-refs (point-min))
-
+        ;; commented add-hover-text func due to perf issues with the implementation
+        ;;(khoj--add-hover-text-to-footnote-refs (point-min))
         ;; render reference footnotes as superscript
         (setq-local
          org-startup-folded "showall"
@@ -739,12 +834,21 @@ Render results in BUFFER-NAME using QUERY, CONTENT-TYPE."
 
         ;; create khoj chat shortcut keybindings
         (use-local-map (copy-keymap org-mode-map))
+        (local-set-key (kbd "q") #'khoj--close)
         (local-set-key (kbd "m") #'khoj--chat)
         (local-set-key (kbd "C-x m") #'khoj--chat)
 
         ;; enable minor modes for khoj chat
         (visual-line-mode)
-        (read-only-mode t)))))
+        (read-only-mode t)))
+    (khoj--open-side-pane buffer-name)))
+
+(defun khoj--close ()
+  "Kill Khoj buffer and window."
+  (interactive)
+  (progn
+    (kill-buffer (current-buffer))
+    (delete-window)))
 
 (defun khoj--add-hover-text-to-footnote-refs (start-pos)
   "Show footnote defs on mouse hover on footnote refs from START-POS."
@@ -770,52 +874,91 @@ Render results in BUFFER-NAME using QUERY, CONTENT-TYPE."
           ;; show definition on hover on footnote reference
           (overlay-put overlay 'help-echo it)))))))
 
-(defun khoj--query-chat-api-and-render-messages (query buffer-name)
-  "Send QUERY to Khoj Chat. Render the chat messages from exchange in BUFFER-NAME."
+(defun khoj--query-chat-api-and-render-messages (query buffer-name &optional session-id)
+  "Send QUERY to Chat SESSION-ID. Render the chat messages in BUFFER-NAME."
   ;; render json response into formatted chat messages
   (with-current-buffer (get-buffer buffer-name)
     (let ((inhibit-read-only t)
-          (new-content-start-pos (point-max))
-          (query-time (format-time-string "%F %T"))
-          (json-response (khoj--query-chat-api query)))
-      (goto-char new-content-start-pos)
+          (query-time (format-time-string "%F %T")))
+      (goto-char (point-max))
       (insert
-       (khoj--render-chat-message query "you" query-time)
-       (khoj--render-chat-response json-response))
-      (khoj--add-hover-text-to-footnote-refs new-content-start-pos))
-    (progn
-      (org-set-startup-visibility)
-      (visual-line-mode)
-      (re-search-backward "^\*+ 🏮" nil t))))
+       (khoj--render-chat-message query "you" query-time))
+      (khoj--query-chat-api query
+                            session-id
+                            #'khoj--format-chat-response
+                            #'khoj--render-chat-response buffer-name))))
 
-(defun khoj--query-chat-api (query)
-  "Send QUERY to Khoj Chat API."
-  (let* ((url-request-method "GET")
-         (encoded-query (url-hexify-string query))
-         (query-url (format "%s/api/chat?q=%s&n=%s&client=emacs" khoj-server-url encoded-query khoj-results-count)))
-    (with-temp-buffer
-      (condition-case ex
-          (progn
-            (url-insert-file-contents query-url)
-            (json-parse-buffer :object-type 'alist))
-        ('file-error (cond ((string-match "Internal server error" (nth 2 ex))
-                      (message "Chat processor not configured. Configure OpenAI API key and restart it. Exception: [%s]" ex))
-                     (t (message "Chat exception: [%s]" ex))))))))
+(defun khoj--query-chat-api (query session-id callback &rest cbargs)
+  "Send QUERY for SESSION-ID to Khoj Chat API.
+Call CALLBACK func with response and CBARGS."
+  (let ((params `(("q" . ,query) ("n" . ,khoj-results-count))))
+    (when session-id (push `("conversation_id" . ,session-id) params))
+    (khoj--call-api-async "/api/chat"
+                          "POST"
+                          nil
+                          params
+                          callback cbargs)))
 
+(defun khoj--get-chat-sessions ()
+  "Get all chat sessions from Khoj server."
+  (khoj--call-api "/api/chat/sessions" "GET"))
 
-(defun khoj--get-chat-history-api ()
-  "Send QUERY to Khoj Chat History API."
-  (let* ((url-request-method "GET")
-         (query-url (format "%s/api/chat/history?client=emacs" khoj-server-url)))
-    (with-temp-buffer
-      (condition-case ex
-          (progn
-            (url-insert-file-contents query-url)
-            (json-parse-buffer :object-type 'alist))
-        ('file-error (cond ((string-match "Internal server error" (nth 2 ex))
-                      (message "Chat processor not configured. Configure OpenAI API key and restart it. Exception: [%s]" ex))
-                     (t (message "Chat exception: [%s]" ex))))))))
+(defun khoj--get-chat-session (&optional session-id)
+  "Get chat messages from default or SESSION-ID chat session."
+  (khoj--call-api "/api/chat/history"
+                  "GET"
+                  (when session-id `(("conversation_id" ,session-id)))))
 
+(defun khoj--select-conversation-session (&optional completion-action)
+  "Select Khoj conversation session to perform COMPLETION-ACTION on."
+  (let* ((completion-text (format "%s Conversation:" (or completion-action "Open")))
+         (sessions (khoj--get-chat-sessions))
+         (session-alist (-map (lambda (session)
+                                (cons (if (not (equal :null (cdr (assoc 'slug session))))
+                                          (cdr (assoc 'slug session))
+                                        (format "New Conversation (%s)" (cdr (assoc 'conversation_id session))))
+                                      (cdr (assoc 'conversation_id session))))
+                              sessions))
+         (selected-session-slug (completing-read completion-text session-alist nil t)))
+    (cdr (assoc selected-session-slug session-alist))))
+
+(defun khoj--open-conversation-session ()
+  "Menu to select Khoj conversation session to open."
+  (let ((selected-session-id (khoj--select-conversation-session "Open")))
+    (khoj--load-chat-session khoj--chat-buffer-name selected-session-id)))
+
+(defun khoj--create-chat-session (&optional agent)
+  "Create new chat session with AGENT."
+  (khoj--call-api "/api/chat/sessions"
+                  "POST"
+                  (when agent `(("agent_slug" ,agent)))))
+
+(defun khoj--new-conversation-session (&optional agent)
+  "Create new Khoj conversation session with AGENT."
+  (thread-last
+    (khoj--create-chat-session agent)
+    (assoc 'conversation_id)
+    (cdr)
+    (khoj--chat)))
+
+(defun khoj--delete-chat-session (session-id)
+  "Delete chat session with SESSION-ID."
+  (khoj--call-api "/api/chat/history" "DELETE" `(("conversation_id" ,session-id))))
+
+(defun khoj--delete-conversation-session ()
+  "Delete new Khoj conversation session."
+  (thread-last
+    (khoj--select-conversation-session "Delete")
+    (khoj--delete-chat-session)))
+
+(defun khoj--get-agents ()
+  "Get list of available Khoj agents."
+  (let* ((response (khoj--call-api "/api/agents" "GET"))
+         (agents (mapcar (lambda (agent)
+                           (cons (cdr (assoc 'name agent))
+                                 (cdr (assoc 'slug agent))))
+                         response)))
+    agents))
 
 (defun khoj--render-chat-message (message sender &optional receive-date)
   "Render chat messages as `org-mode' list item.
@@ -839,38 +982,104 @@ RECEIVE-DATE is the message receive date."
 (defun khoj--generate-reference (reference)
   "Create `org-mode' footnotes with REFERENCE."
   (setq khoj--reference-count (1+ khoj--reference-count))
-  (cons
-   (propertize (format "^{ [fn:%x]}" khoj--reference-count) 'help-echo reference)
-   (thread-last
-     reference
-     ;; remove filename top heading line from reference
-     ;; prevents actual reference heading in next line jumping out of references footnote section
-     (replace-regexp-in-string "^\* .*\n" "")
-     ;; remove multiple, consecutive empty lines from reference
-     (replace-regexp-in-string "\n\n" "\n")
-     (format "\n[fn:%x] %s" khoj--reference-count))))
+  (let ((compiled-reference (if (stringp reference) reference (cdr (assoc 'compiled reference)))))
+    (cons
+     (propertize (format "^{ [fn:%x]}" khoj--reference-count) 'help-echo compiled-reference)
+     (thread-last
+       compiled-reference
+       ;; remove filename top heading line from reference
+       ;; prevents actual reference heading in next line jumping out of references footnote section
+       (replace-regexp-in-string "^\* .*\n" "")
+       ;; remove multiple, consecutive empty lines from reference
+       (replace-regexp-in-string "\n\n" "\n")
+       (format "\n[fn:%x] %s" khoj--reference-count)))))
 
-(defun khoj--render-chat-response (json-response)
-  "Render chat message using JSON-RESPONSE from Khoj Chat API."
+(defun khoj--generate-online-reference (reference)
+  "Create `org-mode' footnotes for online REFERENCE."
+  (setq khoj--reference-count (1+ khoj--reference-count))
+  (let* ((link (cdr (assoc 'link reference)))
+        (title (or (cdr (assoc 'title reference)) link))
+        (description (or (cdr (assoc 'description reference)) title)))
+    (cons
+     (propertize (format "^{ [fn:%x]}" khoj--reference-count) 'help-echo (format "%s\n%s" link description))
+     (thread-last
+       description
+       ;; remove multiple, consecutive empty lines from reference
+       (replace-regexp-in-string "\n\n" "\n")
+       (format "\n[fn:%x] [[%s][%s]]\n%s\n" khoj--reference-count link title)))))
+
+(defun khoj--extract-online-references (result-types query-result-pairs)
+  "Extract link, title and description from RESULT-TYPES in QUERY-RESULT-PAIRS."
+  (let ((result '()))
+    (-map
+     (lambda (search)
+      (let ((search-q (car search))
+            (search-results (cdr search)))
+        (-map-when
+         ;; filter search results by specified result types
+         (lambda (search-result) (member (car search-result) result-types))
+         ;; extract link, title, and description from search results
+         (lambda (search-result)
+           (-map
+            (lambda (entry)
+              (let* ((link (cdr (or (assoc 'link entry) (assoc 'descriptionLink entry))))
+                     (title (cdr (or (assoc 'title entry) `(title . ,link))))
+                     (description (cdr (or (assoc 'snippet entry) (assoc 'description entry)))))
+                (setq result (append result `(((title . ,title) (link . ,link) (description . ,description) (search . ,search-q)))))))
+            ;; wrap search results in a list if it is not already a list
+            (if (or (equal 'knowledgeGraph (car search-result)) (equal 'webpages (car search-result)))
+                (if (arrayp (cdr search-result))
+                    (list (elt (cdr search-result) 0))
+                  (list (cdr search-result)))
+              (cdr search-result))))
+         search-results)))
+     query-result-pairs)
+    result))
+
+(defun khoj--render-chat-response (response buffer-name)
+  "Insert chat message from RESPONSE into BUFFER-NAME."
+  (with-current-buffer (get-buffer buffer-name)
+    (let ((start-pos (point))
+          (inhibit-read-only t))
+      (goto-char (point-max))
+      (insert
+       response
+       (or (khoj--add-hover-text-to-footnote-refs start-pos) ""))
+      (progn
+        (org-set-startup-visibility)
+        (visual-line-mode)
+        (re-search-backward "^\*+ 🏮" nil t)))))
+
+(defun khoj--format-chat-response (json-response &optional callback &rest cbargs)
+  "Format chat message using JSON-RESPONSE from Khoj Chat API.
+Run CALLBACK with CBARGS on formatted message."
   (let* ((message (cdr (or (assoc 'response json-response) (assoc 'message json-response))))
          (sender (cdr (assoc 'by json-response)))
          (receive-date (cdr (assoc 'created json-response)))
-         (references (or (cdr (assoc 'context json-response)) '()))
-         (footnotes (mapcar #'khoj--generate-reference references))
-         (footnote-links (mapcar #'car footnotes))
-         (footnote-defs (mapcar #'cdr footnotes)))
-    (thread-first
-      ;; concatenate khoj message and references from API
-      (concat
-       message
-       ;; append reference links to khoj message
-       (string-join footnote-links "")
-       ;; append reference sub-section to khoj message and fold it
-       (if footnote-defs "\n**** References\n:PROPERTIES:\n:VISIBILITY: folded\n:END:" "")
-       ;; append reference definitions to references subsection
-       (string-join footnote-defs " "))
-      ;; Render chat message using data obtained from API
-      (khoj--render-chat-message sender receive-date))))
+         (online-references  (or (cdr (assoc 'onlineContext json-response)) '()))
+         (online-footnotes (-map #'khoj--generate-online-reference
+                                 (khoj--extract-online-references '(organic knowledgeGraph peopleAlsoAsk webpages)
+                                                                  online-references)))
+         (doc-references (or (cdr (assoc 'context json-response)) '()))
+         (doc-footnotes (mapcar #'khoj--generate-reference doc-references))
+         (footnote-links (mapcar #'car (append doc-footnotes online-footnotes)))
+         (footnote-defs (mapcar #'cdr (append doc-footnotes online-footnotes)))
+         (formatted-response
+          (thread-first
+            ;; concatenate khoj message and references from API
+            (concat
+             message
+             ;; append reference links to khoj message
+             (string-join footnote-links "")
+             ;; append reference sub-section to khoj message and fold it
+             (if footnote-defs "\n**** References\n:PROPERTIES:\n:VISIBILITY: folded\n:END:" "")
+             ;; append reference definitions to references subsection
+             (string-join footnote-defs " "))
+            ;; Render chat message using data obtained from API
+            (khoj--render-chat-message sender receive-date))))
+    (if callback
+        (apply callback formatted-response cbargs)
+        formatted-response)))
 
 
 ;; ------------------
@@ -881,8 +1090,7 @@ RECEIVE-DATE is the message receive date."
   "Perform Incremental Search on Khoj. Allow optional RERANK of results."
   (let* ((rerank-str (cond (rerank "true") (t "false")))
          (khoj-buffer-name (get-buffer-create khoj--search-buffer-name))
-         (query (minibuffer-contents-no-properties))
-         (query-url (khoj--construct-search-api-query query khoj--content-type rerank-str)))
+         (query (minibuffer-contents-no-properties)))
     ;; Query khoj API only when user in khoj minibuffer and non-empty query
     ;; Prevents querying if
     ;;   1. user hasn't started typing query
@@ -902,10 +1110,10 @@ RECEIVE-DATE is the message receive date."
           (setq khoj--rerank t)
           (message "khoj.el: Rerank Results"))
         (khoj--query-search-api-and-render-results
-         query-url
-         khoj--content-type
          query
-         khoj-buffer-name))))))
+         khoj--content-type
+         khoj-buffer-name
+         rerank-str))))))
 
 (defun khoj--delete-open-network-connections-to-server ()
   "Delete all network connections to khoj server."
@@ -913,13 +1121,16 @@ RECEIVE-DATE is the message receive date."
     (let ((proc-buf (buffer-name (process-buffer proc)))
           (khoj-network-proc-buf (string-join (split-string khoj-server-url "://") " ")))
       (when (string-match (format "%s" khoj-network-proc-buf) proc-buf)
-        (delete-process proc)))))
+        (ignore-errors (delete-process proc))))))
 
 (defun khoj--teardown-incremental-search ()
   "Teardown hooks used for incremental search."
   (message "khoj.el: Teardown Incremental Search")
   ;; unset khoj minibuffer window
   (setq khoj--minibuffer-window nil)
+  (when (and khoj--search-on-idle-timer
+             (timerp khoj--search-on-idle-timer))
+    (cancel-timer khoj--search-on-idle-timer))
   ;; delete open connections to khoj server
   (khoj--delete-open-network-connections-to-server)
   ;; remove hooks for khoj incremental query and self
@@ -930,8 +1141,8 @@ RECEIVE-DATE is the message receive date."
   "Natural, Incremental Search for your personal notes and documents."
   (interactive)
   (let* ((khoj-buffer-name (get-buffer-create khoj--search-buffer-name)))
-    ;; switch to khoj results buffer
-    (switch-to-buffer khoj-buffer-name)
+    ;; switch to khoj search buffer
+    (khoj--open-side-pane khoj-buffer-name)
     ;; open and setup minibuffer for incremental search
     (minibuffer-with-setup-hook
         (lambda ()
@@ -942,14 +1153,26 @@ RECEIVE-DATE is the message receive date."
           ;; set current (mini-)buffer entered as khoj minibuffer
           ;; used to query khoj API only when user in khoj minibuffer
           (setq khoj--minibuffer-window (current-buffer))
-          (add-hook 'post-command-hook #'khoj--incremental-search) ; do khoj incremental search after every user action
-          (add-hook 'minibuffer-exit-hook #'khoj--teardown-incremental-search)) ; teardown khoj incremental search on minibuffer exit
+          ; do khoj incremental search after idle time
+          (setq khoj--search-on-idle-timer (run-with-idle-timer khoj-search-on-idle-time t #'khoj--incremental-search))
+          ; teardown khoj incremental search on minibuffer exit
+          (add-hook 'minibuffer-exit-hook #'khoj--teardown-incremental-search))
       (read-string khoj--query-prompt))))
 
 
 ;; --------------
 ;; Similar Search
 ;; --------------
+
+(defun khoj--get-current-outline-entry-pos ()
+  "Get heading position of current outline section."
+  ;; get heading position of current outline entry
+  (cond
+   ;; when at heading of entry
+   ((looking-at outline-regexp)
+    (point))
+   ;; when within entry
+   (t (save-excursion (outline-previous-heading) (point)))))
 
 (defun khoj--get-current-outline-entry-text ()
   "Get text under current outline section."
@@ -994,37 +1217,76 @@ Paragraph only starts at first text after blank line."
                  ;; get paragraph, if in text mode
                  (t
                   (khoj--get-current-paragraph-text))))
-         (query-url (khoj--construct-search-api-query query content-type rerank))
-         ;; extract heading to show in result buffer from query
-         (query-title
-          (format "Similar to: %s"
-                  (replace-regexp-in-string "^[#\\*]* " "" (car (split-string query "\n")))))
          (buffer-name (get-buffer-create khoj--search-buffer-name)))
     (progn
       (khoj--query-search-api-and-render-results
-       query-url
+       query
        content-type
-       query-title
-       buffer-name)
-      (switch-to-buffer buffer-name)
-      (goto-char (point-min)))))
+       buffer-name
+       rerank
+       t)
+      (khoj--open-side-pane buffer-name))))
+
+(defun khoj--auto-find-similar ()
+  "Call find similar on current element, if point has moved to a new element."
+  ;; Call find similar
+  (when (and (derived-mode-p 'org-mode)
+             (org-element-at-point)
+             (not (string= (buffer-name (current-buffer)) khoj--search-buffer-name))
+             (get-buffer-window khoj--search-buffer-name))
+    (let ((current-heading-pos (khoj--get-current-outline-entry-pos)))
+      (unless (eq current-heading-pos khoj--last-heading-pos)
+          (setq khoj--last-heading-pos current-heading-pos)
+          (khoj--find-similar)))))
+
+(defun khoj--setup-auto-find-similar ()
+  "Setup automatic call to find similar to current element."
+  (if khoj-auto-find-similar
+      (add-hook 'post-command-hook #'khoj--auto-find-similar)
+    (remove-hook 'post-command-hook #'khoj--auto-find-similar)))
+
+(defun khoj-toggle-auto-find-similar ()
+    "Toggle automatic call to find similar to current element."
+    (interactive)
+    (setq khoj-auto-find-similar (not khoj-auto-find-similar))
+    (khoj--setup-auto-find-similar)
+    (if khoj-auto-find-similar
+        (message "Auto find similar enabled")
+      (message "Auto find similar disabled")))
 
 
 ;; ---------
 ;; Khoj Menu
 ;; ---------
 
-(transient-define-argument khoj--content-type-switch ()
-  :class 'transient-switches
-  :argument-format "--content-type=%s"
-  :argument-regexp ".+"
-  ;; set content type to: last used > based on current buffer > default type
-  :init-value (lambda (obj) (oset obj value (format "--content-type=%s" (or khoj--content-type (khoj--buffer-name-to-content-type (buffer-name))))))
-  ;; dynamically set choices to content types enabled on khoj backend
-  :choices (or (ignore-errors (mapcar #'symbol-name (khoj--get-enabled-content-types))) '("all" "org" "markdown" "pdf" "image")))
+(defun khoj--setup-and-show-menu ()
+  "Create main Transient menu for Khoj and show it."
+  ;; Create the Khoj Transient menu
+  (transient-define-argument khoj--content-type-switch ()
+    :class 'transient-switches
+    :argument-format "--content-type=%s"
+    :argument-regexp ".+"
+    ;; set content type to: last used > based on current buffer > default type
+    :init-value (lambda (obj) (oset obj value (format "--content-type=%s" (or khoj--content-type (khoj--buffer-name-to-content-type (buffer-name))))))
+    ;; dynamically set choices to content types enabled on khoj backend
+    :choices (or (ignore-errors (mapcar #'symbol-name (khoj--get-enabled-content-types))) '("all" "org" "markdown" "pdf" "image")))
 
-(transient-define-suffix khoj--search-command (&optional args)
-  (interactive (list (transient-args transient-current-command)))
+  (transient-define-argument khoj--agent-switch ()
+    :class 'transient-switches
+    :argument-format "--agent=%s"
+    :argument-regexp ".+"
+    :init-value (lambda (obj)
+                  (oset obj value (format "--agent=%s" khoj--selected-agent)))
+    :choices (or (ignore-errors (mapcar #'cdr (khoj--get-agents))) '("khoj"))
+    :reader (lambda (prompt initial-input history)
+              (let* ((agents (khoj--get-agents))
+                    (selected (completing-read prompt agents nil t initial-input history))
+                    (slug (cdr (assoc selected agents))))
+                (setq khoj--selected-agent slug)
+                slug)))
+
+  (transient-define-suffix khoj--search-command (&optional args)
+    (interactive (list (transient-args transient-current-command)))
     (progn
       ;; set content type to: specified > last used > based on current buffer > default type
       (setq khoj--content-type (or (transient-arg-value "--content-type=" args) (khoj--buffer-name-to-content-type (buffer-name))))
@@ -1033,9 +1295,9 @@ Paragraph only starts at first text after blank line."
       ;; trigger incremental search
       (call-interactively #'khoj-incremental)))
 
-(transient-define-suffix khoj--find-similar-command (&optional args)
-  "Find items similar to current item at point."
-  (interactive (list (transient-args transient-current-command)))
+  (transient-define-suffix khoj--find-similar-command (&optional args)
+    "Find items similar to current item at point."
+    (interactive (list (transient-args transient-current-command)))
     (progn
       ;; set content type to: specified > last used > based on current buffer > default type
       (setq khoj--content-type (or (transient-arg-value "--content-type=" args) (khoj--buffer-name-to-content-type (buffer-name))))
@@ -1043,37 +1305,65 @@ Paragraph only starts at first text after blank line."
       (setq khoj-results-count (or (transient-arg-value "--results-count=" args) khoj-results-count))
       (khoj--find-similar khoj--content-type)))
 
-(transient-define-suffix khoj--update-command (&optional args)
-  "Call khoj API to update index of specified content type."
-  (interactive (list (transient-args transient-current-command)))
-  (let* ((force-update (if (member "--force-update" args) "true" "false"))
-         ;; set content type to: specified > last used > based on current buffer > default type
-         (content-type (or (transient-arg-value "--content-type=" args) (khoj--buffer-name-to-content-type (buffer-name))))
-         (type-query (if (equal content-type "all") "" (format "t=%s" content-type)))
-         (update-url (format "%s/api/update?%s&force=%s&client=emacs" khoj-server-url type-query force-update))
-         (url-request-method "GET"))
-    (progn
-      (setq khoj--content-type content-type)
-      (url-retrieve update-url (lambda (_) (message "khoj.el: %s index %supdated!" content-type (if (member "--force-update" args) "force " "")))))))
+  (transient-define-suffix khoj--update-command (&optional args)
+    "Call khoj API to update index of specified content type."
+    (interactive (list (transient-args transient-current-command)))
+    (let* ((force-update (if (member "--force-update" args) t nil))
+           ;; set content type to: specified > last used > based on current buffer > default type
+           (content-type (or (transient-arg-value "--content-type=" args) (khoj--buffer-name-to-content-type (buffer-name))))
+           (url-request-method "GET"))
+      (progn
+        (setq khoj--content-type content-type)
+        (khoj--server-index-files force-update content-type))))
 
-(transient-define-suffix khoj--chat-command (&optional _)
-  "Command to Chat with Khoj."
-  (interactive (list (transient-args transient-current-command)))
-  (khoj--chat))
+  (transient-define-suffix khoj--chat-command (&optional _)
+    "Command to Chat with Khoj."
+    (interactive (list (transient-args transient-current-command)))
+    (khoj--chat))
 
-(transient-define-prefix khoj--menu ()
-  "Create Khoj Menu to Configure and Execute Commands."
-  [["Configure Search"
-    ("n" "Results Count" "--results-count=" :init-value (lambda (obj) (oset obj value (format "%s" khoj-results-count))))
-    ("t" "Content Type" khoj--content-type-switch)]
-   ["Configure Update"
-    ("-f" "Force Update" "--force-update")]]
-  [["Act"
-    ("c" "Chat" khoj--chat-command)
-    ("s" "Search" khoj--search-command)
-    ("f" "Find Similar" khoj--find-similar-command)
-    ("u" "Update" khoj--update-command)
-    ("q" "Quit" transient-quit-one)]])
+  (transient-define-suffix khoj--open-conversation-session-command (&optional _)
+    "Command to select Khoj conversation sessions to open."
+    (interactive (list (transient-args transient-current-command)))
+    (khoj--open-conversation-session))
+
+  (transient-define-suffix khoj--new-conversation-session-command (&optional args)
+    "Command to select Khoj conversation sessions to open."
+    (interactive (list (transient-args transient-current-command)))
+    (let ((agent-slug (transient-arg-value "--agent=" args)))
+      (khoj--new-conversation-session agent-slug)))
+
+  (transient-define-suffix khoj--delete-conversation-session-command (&optional _)
+    "Command to select Khoj conversation sessions to delete."
+    (interactive (list (transient-args transient-current-command)))
+    (khoj--delete-conversation-session))
+
+  (transient-define-prefix khoj--chat-menu ()
+    "Create the Khoj Chat Menu and Execute Commands."
+    [["Configure"
+      ("a" "Select Agent" khoj--agent-switch)]]
+    [["Act"
+      ("c" "Chat" khoj--chat-command)
+      ("o" "Open Conversation" khoj--open-conversation-session-command)
+      ("n" "New Conversation" khoj--new-conversation-session-command)
+      ("d" "Delete Conversation" khoj--delete-conversation-session-command)
+      ("q" "Quit" transient-quit-one)]])
+
+  (transient-define-prefix khoj--menu ()
+    "Create Khoj Menu to Configure and Execute Commands."
+    [["Configure Search"
+      ("-n" "Results Count" "--results-count=" :init-value (lambda (obj) (oset obj value (format "%s" khoj-results-count))))
+      ("t" "Content Type" khoj--content-type-switch)]
+     ["Configure Update"
+      ("-f" "Force Update" "--force-update")]]
+    [["Act"
+      ("c" "Chat" khoj--chat-menu)
+      ("s" "Search" khoj--search-command)
+      ("f" "Find Similar" khoj--find-similar-command)
+      ("u" "Update" khoj--update-command)
+      ("q" "Quit" transient-quit-one)]])
+
+  ;; Show the Khoj Transient menu
+  (khoj--menu))
 
 
 ;; ----------
@@ -1082,11 +1372,14 @@ Paragraph only starts at first text after blank line."
 
 ;;;###autoload
 (defun khoj ()
-  "Provide natural, search assistance for your notes, documents and images."
+  "Search and chat with your knowledge base using your personal AI copilot.
+
+Collaborate with Khoj to search, create, review and update your knowledge base.
+Research across the internet & your documents from the comfort of Emacs."
   (interactive)
   (when khoj-auto-setup
     (khoj-setup t))
-  (khoj--menu))
+  (khoj--setup-and-show-menu))
 
 (provide 'khoj)
 

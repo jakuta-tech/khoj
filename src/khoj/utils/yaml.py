@@ -1,13 +1,9 @@
-# Standard Packages
 from pathlib import Path
 
-# External Packages
 import yaml
 
-# Internal Packages
-from khoj.utils.rawconfig import FullConfig
 from khoj.utils import state
-
+from khoj.utils.rawconfig import FullConfig
 
 # Do not emit tags when dumping to YAML
 yaml.emitter.Emitter.process_tag = lambda self, *args, **kwargs: None  # type: ignore[assignment]
@@ -39,9 +35,13 @@ def load_config_from_file(yaml_config_file: Path) -> dict:
 
 def parse_config_from_string(yaml_config: dict) -> FullConfig:
     "Parse and validate config in YML string"
-    return FullConfig.parse_obj(yaml_config)
+    return FullConfig.model_validate(yaml_config)
 
 
 def parse_config_from_file(yaml_config_file):
     "Parse and validate config in YML file"
     return parse_config_from_string(load_config_from_file(yaml_config_file))
+
+
+def yaml_dump(data):
+    return yaml.dump(data, allow_unicode=True, sort_keys=False, default_flow_style=False)

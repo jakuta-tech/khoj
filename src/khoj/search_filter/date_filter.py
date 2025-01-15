@@ -1,18 +1,16 @@
-# Standard Packages
-import re
+import calendar
 import logging
+import re
 from collections import defaultdict
-from datetime import timedelta, datetime
-from dateutil.relativedelta import relativedelta
+from datetime import datetime, timedelta
 from math import inf
+from typing import List, Tuple
 
-# External Packages
 import dateparser as dtparse
+from dateutil.relativedelta import relativedelta
 
-# Internal Packages
 from khoj.search_filter.base_filter import BaseFilter
-from khoj.utils.helpers import LRU, timer
-
+from khoj.utils.helpers import LRU, merge_dicts, timer
 
 logger = logging.getLogger(__name__)
 
@@ -23,31 +21,93 @@ class DateFilter(BaseFilter):
     # - dt>="yesterday" dt<"tomorrow"
     # - dt>="last week"
     # - dt:"2 years ago"
-    date_regex = r"dt([:><=]{1,2})[\"'](.*?)[\"']"
+    date_regex = r"dt([:><=]{1,2})[\"'‘’](.*?)[\"'‘’]"
 
-    def __init__(self, entry_key="raw"):
+    def __init__(self, entry_key="compiled"):
         self.entry_key = entry_key
         self.date_to_entry_ids = defaultdict(set)
         self.cache = LRU()
+        self.dtparser_regexes = self.compile_date_regexes()
+        self.dtparser_ordinal_suffixes = re.compile(r"(st|nd|rd|th)")
+        self.dtparser_settings = {
+            "PREFER_DAY_OF_MONTH": "first",
+            "DATE_ORDER": "YMD",  # Prefer YMD and DMY over MDY when parsing ambiguous dates
+        }
 
-    def load(self, entries, *args, **kwargs):
-        with timer("Created date filter index", logger):
-            for id, entry in enumerate(entries):
-                # Extract dates from entry
-                for date_in_entry_string in re.findall(r"\d{4}-\d{2}-\d{2}", getattr(entry, self.entry_key)):
-                    # Convert date string in entry to unix timestamp
-                    try:
-                        date_in_entry = datetime.strptime(date_in_entry_string, "%Y-%m-%d").timestamp()
-                    except ValueError:
-                        continue
-                    except OSError:
-                        logger.debug(f"OSError: Ignoring unprocessable date in entry: {date_in_entry_string}")
-                        continue
-                    self.date_to_entry_ids[date_in_entry].add(id)
+    def compile_date_regexes(self):
+        months = calendar.month_name[1:]
+        abbr_months = calendar.month_abbr[1:]
+        # Extract natural dates from content like 1st April 1984, 31 April 84, Apr 4th 1984, 13 Apr 84
+        dBY_regex = re.compile(r"\b\d{1,2}(?:st|nd|rd|th)? (?:" + "|".join(months) + r") \d{4}\b", re.IGNORECASE)
+        dBy_regex = re.compile(r"\b\d{1,2}(?:st|nd|rd|th)? (?:" + "|".join(months) + r") \d{2}\b", re.IGNORECASE)
+        BdY_regex = re.compile(r"\b(?:" + "|".join(months) + r") \d{1,2}(?:st|nd|rd|th)? \d{4}\b", re.IGNORECASE)
+        Bdy_regex = re.compile(r"\b(?:" + "|".join(months) + r") \d{1,2}(?:st|nd|rd|th)? \d{2}\b", re.IGNORECASE)
+        dbY_regex = re.compile(r"\b\d{1,2}(?:st|nd|rd|th)? (?:" + "|".join(abbr_months) + r") \d{4}\b", re.IGNORECASE)
+        dby_regex = re.compile(r"\b\d{1,2}(?:st|nd|rd|th)? (?:" + "|".join(abbr_months) + r") \d{2}\b", re.IGNORECASE)
+        bdY_regex = re.compile(r"\b(?:" + "|".join(abbr_months) + r") \d{1,2}(?:st|nd|rd|th)? \d{4}\b", re.IGNORECASE)
+        bdy_regex = re.compile(r"\b(?:" + "|".join(abbr_months) + r") \d{1,2}(?:st|nd|rd|th)? \d{2}\b", re.IGNORECASE)
+        # Extract natural of form Month, Year like January 2021, Jan 2021, Jan 21
+        BY_regex = re.compile(r"\b(?:" + "|".join(months) + r") \d{4}\b", re.IGNORECASE)
+        By_regex = re.compile(r"\b(?:" + "|".join(months) + r") \d{2}\b", re.IGNORECASE)
+        bY_regex = re.compile(r"\b(?:" + "|".join(abbr_months) + r") \d{4}\b", re.IGNORECASE)
+        by_regex = re.compile(r"\b(?:" + "|".join(abbr_months) + r") \d{2}\b", re.IGNORECASE)
+        # Extract structured dates from content like 1984-04-01, 1984/04/01, 01-04-1984, 01/04/1984, 01.04.1984, 01-04-84, 01/04/84
+        Ymd_date_regex = re.compile(r"\b\d{4}[-\/]\d{2}[-\/]\d{2}\b", re.IGNORECASE)
+        dmY_date_regex = re.compile(r"\b\d{2}[-\/]\d{2}[-\/]\d{4}\b", re.IGNORECASE)
+        dmy_date_regex = re.compile(r"\b\d{2}[-\/]\d{2}[-\/]\d{2}\b", re.IGNORECASE)
+        dmY_dot_date_regex = re.compile(r"\b\d{2}[\.]\d{2}[\.]\d{4}\b", re.IGNORECASE)
 
-    def can_filter(self, raw_query):
-        "Check if query contains date filters"
-        return self.extract_date_range(raw_query) is not None
+        # Combine date formatter and date identifier regex pairs
+        dtparser_regexes: List[Tuple[str, re.Pattern[str]]] = [
+            # Structured dates
+            ("%Y-%m-%d", Ymd_date_regex),
+            ("%Y/%m/%d", Ymd_date_regex),
+            ("%d-%m-%Y", dmY_date_regex),
+            ("%d/%m/%Y", dmY_date_regex),
+            ("%d.%m.%Y", dmY_dot_date_regex),
+            ("%d-%m-%y", dmy_date_regex),
+            ("%d/%m/%y", dmy_date_regex),
+            # Natural dates
+            ("%d %B %Y", dBY_regex),
+            ("%d %B %y", dBy_regex),
+            ("%B %d %Y", BdY_regex),
+            ("%B %d %y", Bdy_regex),
+            ("%d %b %Y", dbY_regex),
+            ("%d %b %y", dby_regex),
+            ("%b %d %Y", bdY_regex),
+            ("%b %d %y", bdy_regex),
+            # Partial natural dates
+            ("%B %Y", BY_regex),
+            ("%B %y", By_regex),
+            ("%b %Y", bY_regex),
+            ("%b %y", by_regex),
+        ]
+        return dtparser_regexes
+
+    def extract_dates(self, content):
+        "Extract natural and structured dates from content"
+        valid_dates = set()
+        for date_format, date_regex in self.dtparser_regexes:
+            matched_dates = date_regex.findall(content)
+            for date_str in matched_dates:
+                # Remove ordinal suffixes to parse date
+                date_str = self.dtparser_ordinal_suffixes.sub("", date_str)
+                try:
+                    valid_dates.add(datetime.strptime(date_str, date_format))
+                except ValueError:
+                    continue
+
+        return list(valid_dates)
+
+    def get_filter_terms(self, query: str) -> List[str]:
+        "Get all filter terms in query"
+        return [f"dt{item[0]}'{item[1]}'" for item in re.findall(self.date_regex, query)]
+
+    def get_query_date_range(self, query) -> List:
+        with timer("Extract date range to filter from query", logger):
+            query_daterange = self.extract_date_range(query)
+
+        return query_daterange
 
     def defilter(self, query):
         # remove date range filter from query
@@ -55,50 +115,15 @@ class DateFilter(BaseFilter):
         query = re.sub(r"\s{2,}", " ", query).strip()  # remove multiple spaces
         return query
 
-    def apply(self, query, entries):
-        "Find entries containing any dates that fall within date range specified in query"
-        # extract date range specified in date filter of query
-        with timer("Extract date range to filter from query", logger):
-            query_daterange = self.extract_date_range(query)
-
-        # if no date in query, return all entries
-        if query_daterange is None:
-            return query, set(range(len(entries)))
-
-        query = self.defilter(query)
-
-        # return results from cache if exists
-        cache_key = tuple(query_daterange)
-        if cache_key in self.cache:
-            logger.debug(f"Return date filter results from cache")
-            entries_to_include = self.cache[cache_key]
-            return query, entries_to_include
-
-        if not self.date_to_entry_ids:
-            self.load(entries)
-
-        # find entries containing any dates that fall with date range specified in query
-        with timer("Mark entries satisfying filter", logger):
-            entries_to_include = set()
-            for date_in_entry in self.date_to_entry_ids.keys():
-                # Check if date in entry is within date range specified in query
-                if query_daterange[0] <= date_in_entry < query_daterange[1]:
-                    entries_to_include |= self.date_to_entry_ids[date_in_entry]
-
-        # cache results
-        self.cache[cache_key] = entries_to_include
-
-        return query, entries_to_include
-
     def extract_date_range(self, query):
         # find date range filter in query
         date_range_matches = re.findall(self.date_regex, query)
 
         if len(date_range_matches) == 0:
-            return None
+            return []
 
         # extract, parse natural dates ranges from date range filter passed in query
-        # e.g today maps to (start_of_day, start_of_tomorrow)
+        # e.g. today maps to (start_of_day, start_of_tomorrow)
         date_ranges_from_filter = []
         for cmp, date_str in date_range_matches:
             if self.parse(date_str):
@@ -106,11 +131,11 @@ class DateFilter(BaseFilter):
                 date_ranges_from_filter += [[cmp, (dt_start.timestamp(), dt_end.timestamp())]]
 
         # Combine dates with their comparators to form date range intervals
-        # For e.g
+        # For e.g.
         #   >=yesterday maps to [start_of_yesterday, inf)
         #   <tomorrow maps to [0, start_of_tomorrow)
         # ---
-        effective_date_range = [0, inf]
+        effective_date_range: List = [0, inf]
         date_range_considering_comparator = []
         for cmp, (dtrange_start, dtrange_end) in date_ranges_from_filter:
             if cmp == ">":
@@ -135,8 +160,17 @@ class DateFilter(BaseFilter):
             ]
 
         if effective_date_range == [0, inf] or effective_date_range[0] > effective_date_range[1]:
-            return None
+            return []
         else:
+            # If the first element is 0, replace it with None
+
+            if effective_date_range[0] == 0:
+                effective_date_range[0] = None
+
+            # If the second element is inf, replace it with None
+            if effective_date_range[1] == inf:
+                effective_date_range[1] = None
+
             return effective_date_range
 
     def parse(self, date_str, relative_base=None):
@@ -144,17 +178,16 @@ class DateFilter(BaseFilter):
         # clean date string to handle future date parsing by date parser
         future_strings = ["later", "from now", "from today"]
         prefer_dates_from = {True: "future", False: "past"}[any([True for fstr in future_strings if fstr in date_str])]
-        clean_date_str = re.sub("|".join(future_strings), "", date_str)
+        dtquery_settings = {"RELATIVE_BASE": relative_base or datetime.now(), "PREFER_DATES_FROM": prefer_dates_from}
+        dtparser_settings = merge_dicts(dtquery_settings, self.dtparser_settings)
 
         # parse date passed in query date filter
-        parsed_date = dtparse.parse(
-            clean_date_str,
-            settings={
-                "RELATIVE_BASE": relative_base or datetime.now(),
-                "PREFER_DAY_OF_MONTH": "first",
-                "PREFER_DATES_FROM": prefer_dates_from,
-            },
-        )
+        clean_date_str = re.sub("|".join(future_strings), "", date_str)
+        try:
+            parsed_date = dtparse.parse(clean_date_str, settings=dtparser_settings)
+        except Exception as e:
+            logger.error(f"Failed to parse date string: {date_str} with error: {e}")
+            return None
 
         if parsed_date is None:
             return None
